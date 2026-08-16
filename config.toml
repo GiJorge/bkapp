@@ -1,0 +1,19 @@
+db_path = "backup_index.db"
+debounce_seconds = 2
+max_concurrent_copies = 4
+
+[[folders]]
+id = "memos"
+source_dir = "/home/jorge/data/"
+destination_dir = "/home/jorge/Videos/RustDesk/"
+exclude = ["*.tmp", "*.log", ".git/*", "target/*", "node_modules/*"]
+
+[[folders]]
+id = "pic"
+source_dir = "/home/jorge/Pictures/Screenshots/"
+destination_dir = "/home/jorge/Desktop/New note/"
+exclude = ["*.tmp", "*.log", ".git/*", "target/*", "node_modules/*"]
+
+# Pruning & Retention Settings
+delete_orphans = true          # Remove files in destination if deleted from source
+retention_days = 30            # Delete files in destination unmodified for > 30 days (0 to disable)

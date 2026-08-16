@@ -1,0 +1,31 @@
+[package]
+name = "rust_backup_daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.38", features = ["full"] }
+
+# Watcher & Event Debouncing (Handles burst file edits safely)
+notify = "6.1"
+notify-debouncer-full = "0.3"
+
+# Embedded SQLite Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Super-fast file hashing
+blake3 = "1.5"
+
+# Directory traversal
+walkdir = "2.5"
+
+# Utility for relative paths
+pathdiff = "0.2"
+
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+axum = "0.7"
+serde_json = "1.0"
+globset = "0.4"
+notify-rust = "4"
