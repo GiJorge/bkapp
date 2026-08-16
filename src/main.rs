@@ -1,6 +1,7 @@
 mod config;
 mod db;
 mod hash;
+mod logger;
 mod notification;
 mod prune;
 mod verify;
@@ -9,6 +10,7 @@ mod web;
 use config::{AppConfig, CompiledFolderRule};
 use db::Db;
 use hash::compute_hash;
+use logger::LogStore;
 use notification::notify_error;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
@@ -30,10 +32,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rules = Arc::new(config.compile_rules()?);
     let db = Arc::new(Mutex::new(Db::init(&config.db_path)?));
 
+    // Global Log Store (keeps last 100 log entries)
+    let logger = LogStore::new(100);
+    logger.add("INFO", "Backup daemon initialized");
+
     // Start Web Server
     let web_db = Arc::clone(&db);
+    let web_logger = logger.clone();
     tokio::spawn(async move {
-        web::start_server(web_db, 3000).await;
+        web::start_server(web_db, web_logger, 3000).await;
     });
 
     // Work Queue Channel & Worker Pool Initialization
@@ -61,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Run Initial Crawl
+    // Run Initial Crawl for all rules
     let mut crawl_handles = vec![];
     for rule in rules.iter().cloned() {
         let tx = job_tx.clone();
@@ -98,6 +105,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Scheduled Interval Backup Tasks (for folders with sync_mode = "interval")
+    for rule in rules.iter().filter(|r| r.mapping.sync_mode == "interval") {
+        let rule = rule.clone();
+        let tx = job_tx.clone();
+        let interval_secs = rule.mapping.interval_seconds;
+        let logger_clone = logger.clone();
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            // Skip the immediate initial tick since initial crawl ran on startup
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+                logger_clone.add("INFO", format!("⏰ Running scheduled scan for [{}]", rule.mapping.id));
+                let _ = run_initial_crawl(&rule, &tx).await;
+            }
+        });
+    }
+
     // File Watcher Instance Setup
     let (watcher_tx, mut watcher_rx) = mpsc::channel::<notify::Result<Event>>(100);
     let mut watcher = RecommendedWatcher::new(
@@ -107,10 +134,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Config::default(),
     )?;
 
+    // Only add real-time ("watch") folders to the file watcher
     for rule in rules.iter() {
-        if rule.mapping.source_dir.exists() {
+        if rule.mapping.sync_mode != "interval" && rule.mapping.source_dir.exists() {
             watcher.watch(&rule.mapping.source_dir, RecursiveMode::Recursive)?;
-            println!("👀 Watching [{}] at {:?}", rule.mapping.id, rule.mapping.source_dir);
+            logger.add("INFO", format!("👀 Watching real-time [{}] at {:?}", rule.mapping.id, rule.mapping.source_dir));
+        } else if rule.mapping.sync_mode == "interval" {
+            logger.add("INFO", format!("⏰ Interval sync configured for [{}] (every {}s)", rule.mapping.id, rule.mapping.interval_seconds));
         }
     }
 
@@ -127,6 +157,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for path in event.paths {
                             if path.is_file() {
                                 if let Some(rule) = rules.iter().find(|r| path.starts_with(&r.mapping.source_dir)) {
+                                    // Ignore events if folder is configured for interval sync mode
+                                    if rule.mapping.sync_mode == "interval" {
+                                        continue;
+                                    }
+
                                     let _ = job_tx
                                         .send(SyncJob {
                                             path: path.clone(),

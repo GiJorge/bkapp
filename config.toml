@@ -6,13 +6,25 @@ max_concurrent_copies = 4
 id = "memos"
 source_dir = "/home/jorge/data/"
 destination_dir = "/home/jorge/Videos/RustDesk/"
+sync_mode = "interval"
+interval_seconds = 3600 # Sync once every hour (3600 seconds)
 exclude = ["*.tmp", "*.log", ".git/*", "target/*", "node_modules/*"]
 
 [[folders]]
 id = "pic"
 source_dir = "/home/jorge/Pictures/Screenshots/"
 destination_dir = "/home/jorge/Desktop/New note/"
+sync_mode = "watch" # Default real-time sync
 exclude = ["*.tmp", "*.log", ".git/*", "target/*", "node_modules/*"]
+
+[[folders]]
+id = "myfile"
+source_dir = "/home/jorge/Desktop/backup codes/"
+destination_dir = "/home/jorge/Videos/myfile/"
+sync_mode = "interval"
+interval_seconds = 3600 # Sync once every hour (3600 seconds)
+exclude = ["*.tmp", "*.log", ".git/*", "target/*", "node_modules/*"]
+
 
 # Pruning & Retention Settings
 delete_orphans = true          # Remove files in destination if deleted from source
