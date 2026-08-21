@@ -8,6 +8,14 @@ pub async fn run_integrity_check(
     rule: &CompiledFolderRule,
     db: &Arc<Mutex<Db>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+
+    // 🛡️ UNMOUNT GUARD: Skip self-healing if drive is unmounted
+    let mount_flag = rule.mapping.destination_dir.join(".mounted");
+    if !mount_flag.exists() {
+        println!("⚠️ Skipping integrity check for [{}]: Destination drive unmounted.", rule.mapping.id);
+        return Ok(());
+    }
+
     // Skip verification if destination drive/share is turned off or unmounted
     if !rule.mapping.destination_dir.exists() {
         return Ok(());

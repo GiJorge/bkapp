@@ -16,6 +16,12 @@ pub async fn run_prune_pass(
         return Ok(());
     }
 
+    // 🛡️ UNMOUNT GUARD: Skip prune pass if destination is unmounted
+    let mount_flag = dest_dir.join(".mounted");
+    if !mount_flag.exists() {
+        return Ok(());
+    }
+
     let now = SystemTime::now();
     let max_age = if rule.mapping.retention_days > 0 {
         Some(Duration::from_secs(rule.mapping.retention_days * 86400))
@@ -33,6 +39,13 @@ pub async fn run_prune_pass(
             Ok(rel) => rel,
             Err(_) => continue,
         };
+
+        // 🛡️ EXCLUSION & HARDGUARD: Skip if path is in config `exclude` list or is `.mounted`
+        if relative_path.file_name().map_or(false, |name| name == ".mounted")
+            || rule.is_excluded(relative_path)
+        {
+            continue;
+        }
 
         let source_path = source_dir.join(relative_path);
         let relative_str = relative_path.to_string_lossy().to_string();

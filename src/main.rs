@@ -16,7 +16,7 @@ use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watche
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::signal::unix::{signal, SignalKind};
+//use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use walkdir::WalkDir;
 
@@ -29,12 +29,18 @@ pub struct SyncJob {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load_or_create("config.toml")?;
+    
+
     let rules = Arc::new(config.compile_rules()?);
     let db = Arc::new(Mutex::new(Db::init(&config.db_path)?));
 
     // Global Log Store (keeps last 100 log entries)
-    let logger = LogStore::new(100);
-    logger.add("INFO", "Backup daemon initialized");
+    // let logger = LogStore::new(100);
+    // logger.add("INFO", "Backup daemon initialized");
+
+    // Pass config.timezone into LogStore
+let logger = LogStore::new(100, config.timezone.clone());
+logger.add("INFO", "Backup daemon initialized");
 
     // Start Web Server
     let web_db = Arc::clone(&db);
@@ -185,12 +191,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn shutdown_signal() {
-    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
-    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to register SIGTERM handler");
+        sigterm.recv().await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = sigterm.recv() => {},
-        _ = sigint.recv() => {},
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
 }
 
@@ -246,6 +265,20 @@ async fn sync_single_file(
     if rule.is_excluded(relative_path) {
         return Ok(());
     }
+
+    // 🛡️ UNMOUNT GUARD: Do not attempt sync if destination drive is unmounted
+    // let mount_flag = rule.mapping.destination_dir.join(".mounted");
+    // if !mount_flag.exists() {
+    //     return Ok(());
+    // }
+
+    // 🛡️ UNMOUNT / DISCONNECT GUARD
+    if !rule.mapping.destination_dir.exists() || !rule.mapping.destination_dir.join(".mounted").exists() {
+        // Destination is disconnected or unmounted; skip quietly without crashing
+        return Ok(());
+    }
+
+    
 
     let relative_str = relative_path.to_string_lossy().to_string();
 

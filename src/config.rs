@@ -16,6 +16,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FolderMapping {
     pub id: String,
@@ -39,6 +43,8 @@ pub struct AppConfig {
     pub db_path: PathBuf,
     pub debounce_seconds: u64,
     pub max_concurrent_copies: usize,
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
 }
 
 #[derive(Debug, Clone)]
@@ -66,13 +72,14 @@ impl AppConfig {
                     destination_dir: PathBuf::from(format!("{}/backups/memos", home)),
                     sync_mode: "watch".to_string(),
                     interval_seconds: 3600,
-                    exclude: vec!["*.tmp".to_string(), "*.log".to_string(), "target/*".to_string()],
+                    exclude: vec![".mounted".to_string(), "*.tmp".to_string(), "*.log".to_string(), "target/*".to_string()],
                     delete_orphans: true,
                     retention_days: 0,
                 }],
                 db_path: PathBuf::from("backup_index.db"),
                 debounce_seconds: 2,
                 max_concurrent_copies: 4,
+                timezone: "UTC".to_string(),
             };
 
             let toml_str = toml::to_string_pretty(&default_config)?;
@@ -126,12 +133,13 @@ impl AppConfig {
                 ));
             }
 
-            if !folder.destination_dir.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Destination directory for [{}] does not exist: {:?}", folder.id, folder.destination_dir),
-                ));
-            }
+          // 🛡️ Mount Check: Log warning if destination is unmounted/missing instead of crashing
+        if !folder.destination_dir.exists() {
+            println!(
+                "⚠️ Destination directory for [{}] is currently unavailable or unmounted: {:?}",
+                folder.id, folder.destination_dir
+            );
+        }
         }
         Ok(())
     }

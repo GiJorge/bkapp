@@ -1,3 +1,5 @@
+use chrono::Utc;
+use chrono_tz::Tz;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -13,19 +15,27 @@ pub struct LogEntry {
 pub struct LogStore {
     logs: Arc<Mutex<VecDeque<LogEntry>>>,
     max_size: usize,
+    timezone: String,
 }
 
 impl LogStore {
-    pub fn new(max_size: usize) -> Self {
+    pub fn new(max_size: usize, timezone: String) -> Self {
         Self {
             logs: Arc::new(Mutex::new(VecDeque::new())),
             max_size,
+            timezone,
         }
     }
 
     pub fn add(&self, level: &str, message: impl Into<String>) {
+        // Parse IANA timezone string or fallback to UTC
+        let tz: Tz = self.timezone.parse().unwrap_or(chrono_tz::UTC);
+        
+        // 🕒 Updated format string to 12-hour AM/PM time (%l for non-padded hour, %p for AM/PM)
+        let timestamp = Utc::now().with_timezone(&tz).format("%l:%M:%S %p").to_string();
+
         let entry = LogEntry {
-            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            timestamp,
             level: level.to_string(),
             message: message.into(),
         };

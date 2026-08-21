@@ -1,0 +1,18 @@
+db_path = "backup_index.db"
+debounce_seconds = 2
+max_concurrent_copies = 4
+
+[[folders]]
+id = "documents"
+source_dir = "C:\\Users\\YourName\\Documents"
+destination_dir = "D:\\Backups\\Documents"
+sync_mode = "watch"
+exclude = ["*.tmp", "~$*"]
+
+[[folders]]
+id = "databases"
+source_dir = "C:\\Users\\YourName\\Databases"
+destination_dir = "D:\\Backups\\Databases"
+sync_mode = "interval"
+interval_seconds = 3600
+exclude = ["backup_index.db*", "*.log"]
