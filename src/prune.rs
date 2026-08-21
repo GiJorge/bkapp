@@ -12,6 +12,7 @@ pub async fn run_prune_pass(
     let dest_dir = &rule.mapping.destination_dir;
     let source_dir = &rule.mapping.source_dir;
 
+    
     if !dest_dir.exists() {
         return Ok(());
     }

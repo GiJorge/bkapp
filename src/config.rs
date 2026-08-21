@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use crate::logger::LogStore;
 
 fn default_sync_mode() -> String {
     "watch".to_string()
@@ -31,6 +32,8 @@ pub struct FolderMapping {
     pub interval_seconds: u64, // Default 3600 (1 hr)
     #[serde(default)]
     pub exclude: Vec<String>,
+    #[serde(default)]
+    pub include: Vec<String>,
     #[serde(default = "default_true")]
     pub delete_orphans: bool,
     #[serde(default)]
@@ -50,7 +53,8 @@ pub struct AppConfig {
 #[derive(Debug, Clone)]
 pub struct CompiledFolderRule {
     pub mapping: FolderMapping,
-    pub glob_set: GlobSet,
+    pub exclude_glob_set: GlobSet,
+    pub include_glob_set: Option<GlobSet>,
 }
 
 impl AppConfig {
@@ -73,6 +77,7 @@ impl AppConfig {
                     sync_mode: "watch".to_string(),
                     interval_seconds: 3600,
                     exclude: vec![".mounted".to_string(), "*.tmp".to_string(), "*.log".to_string(), "target/*".to_string()],
+                    include: vec![],
                     delete_orphans: true,
                     retention_days: 0,
                 }],
@@ -91,29 +96,61 @@ impl AppConfig {
     }
 
     /// Compile string glob patterns into optimized GlobSets
-    pub fn compile_rules(&self) -> Result<Vec<CompiledFolderRule>, globset::Error> {
+ pub fn compile_rules(&self, logger: &LogStore) -> Vec<CompiledFolderRule> {
         let mut rules = Vec::new();
 
         for folder in &self.folders {
-            let mut builder = GlobSetBuilder::new();
+            // 🛡️ RECURSIVE LOOP GUARD: Log warning to Web UI and skip dangerous mappings
+            if let Err(err_msg) = validate_path_boundaries(&folder.source_dir, &folder.destination_dir) {
+                eprintln!("⚠️ [CONFIG WARNING] Folder '{}' skipped: {}", folder.id, err_msg);
+                logger.add("ERROR", format!("Skipped folder ['{}']: {}", folder.id, err_msg));
+                continue;
+            }
+
+            // Build Exclude GlobSet
+            let mut exclude_builder = GlobSetBuilder::new();
             for pattern in &folder.exclude {
-                // Support matching subdirectories or root-relative files
                 let glob_str = if pattern.starts_with('*') || pattern.contains('/') {
                     pattern.clone()
                 } else {
                     format!("**/{}", pattern)
                 };
-                builder.add(Glob::new(&glob_str)?);
+                if let Ok(glob) = Glob::new(&glob_str) {
+                    exclude_builder.add(glob);
+                }
             }
-            let glob_set = builder.build()?;
+            let exclude_glob_set = exclude_builder.build().unwrap_or_default();
+
+            // Build Include GlobSet
+            let include_glob_set = if !folder.include.is_empty() {
+                let mut include_builder = GlobSetBuilder::new();
+                for pattern in &folder.include {
+                    let glob_str = if pattern.starts_with('*') || pattern.contains('/') {
+                        pattern.clone()
+                    } else {
+                        format!("**/{}", pattern)
+                    };
+                    if let Ok(glob) = Glob::new(&glob_str) {
+                        include_builder.add(glob);
+                    }
+                }
+                include_builder.build().ok()
+            } else {
+                None
+            };
+
             rules.push(CompiledFolderRule {
                 mapping: folder.clone(),
-                glob_set,
+                exclude_glob_set,
+                include_glob_set,
             });
         }
 
-        Ok(rules)
+        rules
     }
+
+
+
 
     fn clean_and_expand_paths(&mut self) {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".to_string());
@@ -133,17 +170,27 @@ impl AppConfig {
                 ));
             }
 
-          // 🛡️ Mount Check: Log warning if destination is unmounted/missing instead of crashing
-        if !folder.destination_dir.exists() {
-            println!(
-                "⚠️ Destination directory for [{}] is currently unavailable or unmounted: {:?}",
-                folder.id, folder.destination_dir
-            );
-        }
+            // Check if destination exists
+            if folder.destination_dir.exists() {
+                // 📌 Auto-create .mounted file if destination directory is accessible
+                let mount_flag = folder.destination_dir.join(".mounted");
+                if !mount_flag.exists() {
+                    let _ = fs::File::create(&mount_flag);
+                }
+            } else {
+                println!(
+                    "⚠️ Destination directory for [{}] is currently unavailable or unmounted: {:?}",
+                    folder.id, folder.destination_dir
+                );
+            }
         }
         Ok(())
     }
 }
+
+
+
+
 
 fn clean_path(path: &Path, home: &str) -> PathBuf {
     let raw = path.to_string_lossy();
@@ -159,7 +206,55 @@ fn clean_path(path: &Path, home: &str) -> PathBuf {
 }
 
 impl CompiledFolderRule {
+    /// Helper to maintain backward compatibility with old `is_excluded` call sites
     pub fn is_excluded<P: AsRef<Path>>(&self, relative_path: P) -> bool {
-        self.glob_set.is_match(relative_path.as_ref())
+        self.exclude_glob_set.is_match(relative_path.as_ref())
     }
+
+    /// Evaluates both exclude rules and include whitelists
+    pub fn is_allowed<P: AsRef<Path>>(&self, relative_path: P) -> bool {
+        let path = relative_path.as_ref();
+
+        // 1. If exclude rule matches, reject
+        if self.exclude_glob_set.is_match(path) {
+            return false;
+        }
+
+        // 2. If include set exists, reject files that do NOT match the whitelist
+        if let Some(ref include_set) = self.include_glob_set {
+            return include_set.is_match(path);
+        }
+
+        true
+    }
+}
+
+
+/// Helper function to check overlapping or nested paths
+fn validate_path_boundaries(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_canon = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
+    let dest_canon = destination.canonicalize().unwrap_or_else(|_| destination.to_path_buf());
+
+    if source_canon == dest_canon {
+        return Err(format!(
+            "Source and Destination cannot be identical! ({:?})",
+            source_canon
+        ));
+    }
+
+    if dest_canon.starts_with(&source_canon) {
+        return Err(format!(
+            "Destination ({:?}) is inside Source ({:?}). Loop prevented!",
+            dest_canon, source_canon
+        ));
+    }
+
+    if source_canon.starts_with(&dest_canon) {
+        return Err(format!(
+            "Source ({:?}) is inside Destination ({:?}). Loop prevented!",
+            source_canon, dest_canon
+        ));
+    }
+
+    Ok(())
 }

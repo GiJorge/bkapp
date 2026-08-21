@@ -1,9 +1,11 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
+    http::StatusCode,
     response::{Html, IntoResponse, Json},
-    routing::get,
+    routing::{delete, get},
     Router,
 };
+use serde_json::json;
 use std::sync::{Arc, Mutex};
 use crate::db::Db;
 use crate::logger::LogStore;
@@ -20,6 +22,7 @@ pub async fn start_server(db: Arc<Mutex<Db>>, logger: LogStore, port: u16) {
         .route("/", get(dashboard_html))
         .route("/api/stats", get(get_stats))
         .route("/api/folders", get(get_folders))
+        .route("/api/folders/:id", delete(delete_folder_handler))
         .route("/api/recent", get(get_recent))
         .route("/api/logs", get(get_logs))
         .with_state(state);
@@ -37,7 +40,7 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let db = state.db.lock().unwrap();
     match db.get_stats() {
         Ok(stats) => Json(stats).into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -45,7 +48,39 @@ async fn get_folders(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let db = state.db.lock().unwrap();
     match db.get_folder_stats() {
         Ok(folders) => Json(folders).into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn delete_folder_handler(
+    Path(folder_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let db = state.db.lock().unwrap();
+
+    match db.delete_folder_records(&folder_id) {
+        Ok(rows_deleted) => {
+            state.logger.add(
+                "INFO",
+                format!("🧹 Purged folder [{}] ({} records removed from DB)", folder_id, rows_deleted),
+            );
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "success",
+                    "folder_id": folder_id,
+                    "rows_deleted": rows_deleted
+                })),
+            ).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": e.to_string()
+            })),
+        ).into_response(),
     }
 }
 
@@ -53,7 +88,7 @@ async fn get_recent(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let db = state.db.lock().unwrap();
     match db.get_recent_files() {
         Ok(files) => Json(files).into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -147,6 +182,23 @@ async fn dashboard_html() -> Html<&'static str> {
 
         .tag { background: #0284c7; color: #fff; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem; font-weight: 600; display: inline-block; }
 
+        .btn-delete {
+            background: #991b1b;
+            color: #fecaca;
+            border: 1px solid #dc2626;
+            padding: 0.25rem 0.6rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .btn-delete:hover {
+            background: #dc2626;
+            color: #fff;
+        }
+
         /* Bottom Terminal Logs Layout */
         .terminal-container {
             background: #020617;
@@ -212,7 +264,7 @@ async fn dashboard_html() -> Html<&'static str> {
     <div class="table-container">
         <table>
             <thead>
-                <tr><th>Folder ID</th><th>Total Files</th><th>Data Size</th></tr>
+                <tr><th>Folder ID</th><th>Total Files</th><th>Data Size</th><th>Actions</th></tr>
             </thead>
             <tbody id="folder-table"></tbody>
         </table>
@@ -257,6 +309,9 @@ async fn dashboard_html() -> Html<&'static str> {
                         <td><span class="tag">${escapeHtml(f.folder_id)}</span></td>
                         <td>${f.total_files} files</td>
                         <td>${(f.total_bytes / (1024 * 1024)).toFixed(2)} MB</td>
+                        <td>
+                            <button class="btn-delete" onclick="purgeFolder('${escapeHtml(f.folder_id)}')">🗑️ Drop DB Records</button>
+                        </td>
                     </tr>
                 `).join('');
 
@@ -296,6 +351,25 @@ async fn dashboard_html() -> Html<&'static str> {
                 }
             } catch (err) {
                 console.error("Failed updating dashboard:", err);
+            }
+        }
+
+        async function purgeFolder(folderId) {
+            if (!confirm(`Are you sure you want to drop all DB records for '${folderId}'?`)) {
+                return;
+            }
+
+            try {
+                const res = await fetch(`/api/folders/${folderId}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (res.ok) {
+                    alert(`Purged ${data.rows_deleted} file records for folder '${folderId}'`);
+                    updateDashboard();
+                } else {
+                    alert(`Error: ${data.message}`);
+                }
+            } catch (err) {
+                alert(`Failed to execute delete request: ${err.message}`);
             }
         }
 

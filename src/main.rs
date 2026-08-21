@@ -16,7 +16,6 @@ use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watche
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-//use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use walkdir::WalkDir;
 
@@ -28,19 +27,26 @@ pub struct SyncJob {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = AppConfig::load_or_create("config.toml")?;
-    
+let config = AppConfig::load_or_create("config.toml")?;
 
-    let rules = Arc::new(config.compile_rules()?);
+    // 1. Initialize LogStore first
+    let logger = LogStore::new(100, config.timezone.clone());
+    logger.add("INFO", "Backup daemon initialized");
+
+    // 2. Compile rules passing logger
+    let compiled_rules = config.compile_rules(&logger);
+
+    if compiled_rules.is_empty() {
+        logger.add("ERROR", "No valid folder mappings loaded! Check config.toml.");
+    } else {
+        logger.add("INFO", format!("Loaded {} valid folder rule(s).", compiled_rules.len()));
+    }
+
+    let rules = Arc::new(compiled_rules);
     let db = Arc::new(Mutex::new(Db::init(&config.db_path)?));
+    logger.add("INFO", "Backup daemon initialized");
 
-    // Global Log Store (keeps last 100 log entries)
-    // let logger = LogStore::new(100);
-    // logger.add("INFO", "Backup daemon initialized");
-
-    // Pass config.timezone into LogStore
-let logger = LogStore::new(100, config.timezone.clone());
-logger.add("INFO", "Backup daemon initialized");
+    
 
     // Start Web Server
     let web_db = Arc::clone(&db);
@@ -161,20 +167,27 @@ logger.add("INFO", "Backup daemon initialized");
                         tokio::time::sleep(Duration::from_secs(config.debounce_seconds)).await;
 
                         for path in event.paths {
-                            if path.is_file() {
-                                if let Some(rule) = rules.iter().find(|r| path.starts_with(&r.mapping.source_dir)) {
-                                    // Ignore events if folder is configured for interval sync mode
-                                    if rule.mapping.sync_mode == "interval" {
-                                        continue;
-                                    }
+                            let Some(rule) = rules.iter().find(|r| path.is_file() && path.starts_with(&r.mapping.source_dir)) else {
+                                continue;
+                            };
 
-                                    let _ = job_tx
-                                        .send(SyncJob {
-                                            path: path.clone(),
-                                            rule: rule.clone(),
-                                        })
-                                        .await;
+                            // Ignore events if folder is configured for interval sync mode
+                            if rule.mapping.sync_mode == "interval" {
+                                continue;
+                            }
+
+                            // 🎯 INCLUDE/EXCLUDE CHECK: Skip if path is disallowed by filters
+                            if let Ok(rel_path) = path.strip_prefix(&rule.mapping.source_dir) {
+                                if !rule.is_allowed(rel_path) {
+                                    continue;
                                 }
+
+                                let _ = job_tx
+                                    .send(SyncJob {
+                                        path: path.clone(),
+                                        rule: rule.clone(),
+                                    })
+                                    .await;
                             }
                         }
                     }
@@ -232,14 +245,14 @@ async fn run_initial_crawl(
                 continue;
             }
 
-            if rule.is_excluded(rel_path) {
-                if entry.file_type().is_dir() {
-                    it.skip_current_dir();
-                }
+            // Skip excluded directories entirely to avoid traversing unneeded trees
+            if rule.is_excluded(rel_path) && entry.file_type().is_dir() {
+                it.skip_current_dir();
                 continue;
             }
 
-            if path.is_file() {
+            // 🎯 INCLUDE/EXCLUDE CHECK: Check both exclude and include rules
+            if path.is_file() && rule.is_allowed(rel_path) {
                 let _ = job_tx
                     .send(SyncJob {
                         path: path.to_path_buf(),
@@ -257,28 +270,29 @@ async fn sync_single_file(
     rule: &CompiledFolderRule,
     db: &Arc<Mutex<Db>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // 🛡️ INFINITE LOOP GUARD: Drop paths that point inside destination_dir
+    if path.starts_with(&rule.mapping.destination_dir) {
+        return Ok(());
+    }
+
+
     let relative_path = match path.strip_prefix(&rule.mapping.source_dir) {
         Ok(rel) => rel,
         Err(_) => return Ok(()),
     };
 
-    if rule.is_excluded(relative_path) {
+    // 🎯 INCLUDE/EXCLUDE CHECK: Skip if file does not pass rules
+    if !rule.is_allowed(relative_path) {
         return Ok(());
     }
 
-    // 🛡️ UNMOUNT GUARD: Do not attempt sync if destination drive is unmounted
-    // let mount_flag = rule.mapping.destination_dir.join(".mounted");
-    // if !mount_flag.exists() {
-    //     return Ok(());
-    // }
-
     // 🛡️ UNMOUNT / DISCONNECT GUARD
-    if !rule.mapping.destination_dir.exists() || !rule.mapping.destination_dir.join(".mounted").exists() {
+    if !rule.mapping.destination_dir.exists()
+        || !rule.mapping.destination_dir.join(".mounted").exists()
+    {
         // Destination is disconnected or unmounted; skip quietly without crashing
         return Ok(());
     }
-
-    
 
     let relative_str = relative_path.to_string_lossy().to_string();
 

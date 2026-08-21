@@ -2,24 +2,24 @@ use crate::config::CompiledFolderRule;
 use crate::db::Db;
 use crate::hash::compute_hash;
 use crate::notification::notify_heal;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub async fn run_integrity_check(
     rule: &CompiledFolderRule,
     db: &Arc<Mutex<Db>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
-    // 🛡️ UNMOUNT GUARD: Skip self-healing if drive is unmounted
-    let mount_flag = rule.mapping.destination_dir.join(".mounted");
-    if !mount_flag.exists() {
-        println!("⚠️ Skipping integrity check for [{}]: Destination drive unmounted.", rule.mapping.id);
+    // 🛡️ UNMOUNT GUARD: Skip self-healing if destination directory or .mounted flag is missing
+    if !rule.mapping.destination_dir.exists()
+        || !rule.mapping.destination_dir.join(".mounted").exists()
+    {
+        println!(
+            "⚠️ Skipping integrity check for [{}]: Destination drive unmounted or unavailable.",
+            rule.mapping.id
+        );
         return Ok(());
     }
 
-    // Skip verification if destination drive/share is turned off or unmounted
-    if !rule.mapping.destination_dir.exists() {
-        return Ok(());
-    }
     let records = {
         let db_lock = db.lock().unwrap();
         db_lock.get_folder_records(&rule.mapping.id)?
@@ -29,11 +29,22 @@ pub async fn run_integrity_check(
         return Ok(());
     }
 
-    println!("🔍 [{}] Running integrity & self-healing audit ({} files)...", rule.mapping.id, records.len());
+    println!(
+        "🔍 [{}] Running integrity & self-healing audit ({} files)...",
+        rule.mapping.id,
+        records.len()
+    );
 
     for record in records {
-        let source_path = rule.mapping.source_dir.join(&record.relative_path);
-        let dest_path = rule.mapping.destination_dir.join(&record.relative_path);
+        let relative_path = Path::new(&record.relative_path);
+
+        // 🎯 INCLUDE/EXCLUDE RULE CHECK: Skip files that do not pass configured filters
+        if !rule.is_allowed(relative_path) {
+            continue;
+        }
+
+        let source_path = rule.mapping.source_dir.join(relative_path);
+        let dest_path = rule.mapping.destination_dir.join(relative_path);
 
         // 1. If source no longer exists, skip (pruning handles orphans)
         if !source_path.exists() {
@@ -41,7 +52,10 @@ pub async fn run_integrity_check(
         }
 
         let needs_healing = if !dest_path.exists() {
-            println!("⚠️ [{}] Destination missing: {}", rule.mapping.id, record.relative_path);
+            println!(
+                "⚠️ [{}] Destination missing: {}",
+                rule.mapping.id, record.relative_path
+            );
             true
         } else {
             // Verify destination hash in background thread
@@ -51,7 +65,10 @@ pub async fn run_integrity_check(
             match dest_hash {
                 Ok(hash) => {
                     if hash != record.blake3_hash {
-                        println!("⚡ [{}] Bit rot/Corruption detected in destination: {}", rule.mapping.id, record.relative_path);
+                        println!(
+                            "⚡ [{}] Bit rot/Corruption detected in destination: {}",
+                            rule.mapping.id, record.relative_path
+                        );
                         true
                     } else {
                         false
@@ -69,7 +86,9 @@ pub async fn run_integrity_check(
 
             if tokio::fs::copy(&source_path, &dest_path).await.is_ok() {
                 let source_buf = source_path.clone();
-                if let Ok(Ok(new_hash)) = tokio::task::spawn_blocking(move || compute_hash(&source_buf)).await {
+                if let Ok(Ok(new_hash)) =
+                    tokio::task::spawn_blocking(move || compute_hash(&source_buf)).await
+                {
                     if let Ok(metadata) = tokio::fs::metadata(&source_path).await {
                         let db_lock = db.lock().unwrap();
                         let _ = db_lock.mark_synced(
@@ -81,7 +100,10 @@ pub async fn run_integrity_check(
                     }
                 }
 
-                println!("🩹 [{}] Self-healed destination file: {}", rule.mapping.id, record.relative_path);
+                println!(
+                    "🩹 [{}] Self-healed destination file: {}",
+                    rule.mapping.id, record.relative_path
+                );
                 // Trigger Desktop Notification
                 notify_heal(&rule.mapping.id, &record.relative_path);
             }

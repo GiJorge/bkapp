@@ -55,6 +55,8 @@ impl Db {
         Ok(Self { conn })
     }
 
+
+
     /// Retrieve all stored file records for a given folder_id
     pub fn get_folder_records(&self, folder_id: &str) -> Result<Vec<StoredRecord>> {
         let mut stmt = self.conn.prepare(
@@ -189,4 +191,14 @@ impl Db {
     )?;
     Ok(())
 }
+
+/// Delete all file records associated with a discarded folder ID
+    pub fn delete_folder_records(&self, folder_id: &str) -> Result<usize, rusqlite::Error> {
+        let count = self.conn.execute(
+            "DELETE FROM file_records WHERE folder_id = ?1",
+            [folder_id],
+        )?;
+        Ok(count)
+    }
+
 }

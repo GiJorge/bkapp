@@ -26,6 +26,14 @@ sync_mode = "interval"
 interval_seconds = 3600 # Sync once every hour (3600 seconds)
 exclude = ["*.tmp", "*.log", ".git/*", "target/*", "node_modules/*"]
 
+[[folders]]
+id = "jf"
+source_dir = "/home/jorge/Pictures/"
+destination_dir = "/home/jorge/Videos/j"
+sync_mode = "watch"
+exclude = ["*.tmp", "*.log", ".git/*", "target/*", "node_modules/*"]
+include = ["*.db","*.sql"]
+
 
 # Pruning & Retention Settings
 delete_orphans = true          # Remove files in destination if deleted from source
