@@ -27,12 +27,28 @@ interval_seconds = 3600 # Sync once every hour (3600 seconds)
 exclude = ["*.tmp", "*.log", ".git/*", "target/*", "node_modules/*"]
 
 [[folders]]
-id = "jf"
-source_dir = "/home/jorge/Pictures/"
-destination_dir = "/home/jorge/Videos/j"
+id = "tst"
+source_dir = "/home/jorge/Downloads/ICONS/"
+destination_dir = "/mnt/networkshare/new_volume/memos-data/"
 sync_mode = "watch"
 exclude = ["*.tmp", "*.log", ".git/*", "target/*", "node_modules/*"]
-include = ["*.db","*.sql"]
+
+[[folders]]
+id = "tst2"
+source_dir = "/home/jorge/Downloads/Rstimage/"
+destination_dir = "/mnt/networkshare/new_volume/bk/"
+sync_mode = "watch"
+exclude = ["*.tmp", "*.log", ".git/*", "target/*", "node_modules/*"]
+include = ["*.png", "*.toml"]
+
+[[folders]]
+id = "fail"
+source_dir = "/home/df/"
+destination_dir = "/mnt/networkshare/dfme/bk/"
+sync_mode = "watch"
+exclude = ["*.tmp", "*.log", ".git/*", "target/*", "node_modules/*"]
+include = ["*.png", "*.toml"]
+
 
 
 # Pruning & Retention Settings

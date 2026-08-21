@@ -27,7 +27,7 @@ pub struct SyncJob {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-let config = AppConfig::load_or_create("config.toml")?;
+    let config = AppConfig::load_or_create("config.toml")?;
 
     // 1. Initialize LogStore first
     let logger = LogStore::new(100, config.timezone.clone());
@@ -44,9 +44,6 @@ let config = AppConfig::load_or_create("config.toml")?;
 
     let rules = Arc::new(compiled_rules);
     let db = Arc::new(Mutex::new(Db::init(&config.db_path)?));
-    logger.add("INFO", "Backup daemon initialized");
-
-    
 
     // Start Web Server
     let web_db = Arc::clone(&db);
@@ -62,6 +59,7 @@ let config = AppConfig::load_or_create("config.toml")?;
     for _ in 0..config.max_concurrent_copies {
         let rx = Arc::clone(&shared_rx);
         let db = Arc::clone(&db);
+        let logger_clone = logger.clone();
 
         tokio::spawn(async move {
             loop {
@@ -72,7 +70,7 @@ let config = AppConfig::load_or_create("config.toml")?;
 
                 match job {
                     Some(job) => {
-                        let _ = sync_single_file(&job.path, &job.rule, &db).await;
+                        let _ = sync_single_file(&job.path, &job.rule, &db, &logger_clone).await;
                     }
                     None => break, // Channel closed on shutdown
                 }
@@ -80,13 +78,14 @@ let config = AppConfig::load_or_create("config.toml")?;
         });
     }
 
-    // Run Initial Crawl for all rules
+    // Run Initial Crawl for all rules (Swallows errors, won't panic)
     let mut crawl_handles = vec![];
     for rule in rules.iter().cloned() {
         let tx = job_tx.clone();
+        let logger_clone = logger.clone();
 
         crawl_handles.push(tokio::spawn(async move {
-            let _ = run_initial_crawl(&rule, &tx).await;
+            run_initial_crawl(&rule, &tx, &logger_clone).await;
         }));
     }
     for handle in crawl_handles {
@@ -126,13 +125,12 @@ let config = AppConfig::load_or_create("config.toml")?;
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-            // Skip the immediate initial tick since initial crawl ran on startup
             ticker.tick().await;
 
             loop {
                 ticker.tick().await;
                 logger_clone.add("INFO", format!("⏰ Running scheduled scan for [{}]", rule.mapping.id));
-                let _ = run_initial_crawl(&rule, &tx).await;
+                run_initial_crawl(&rule, &tx, &logger_clone).await;
             }
         });
     }
@@ -146,13 +144,17 @@ let config = AppConfig::load_or_create("config.toml")?;
         Config::default(),
     )?;
 
-    // Only add real-time ("watch") folders to the file watcher
     for rule in rules.iter() {
         if rule.mapping.sync_mode != "interval" && rule.mapping.source_dir.exists() {
-            watcher.watch(&rule.mapping.source_dir, RecursiveMode::Recursive)?;
-            logger.add("INFO", format!("👀 Watching real-time [{}] at {:?}", rule.mapping.id, rule.mapping.source_dir));
+            if let Err(e) = watcher.watch(&rule.mapping.source_dir, RecursiveMode::Recursive) {
+                logger.add("ERROR", format!("Failed to watch source for [{}]: {}", rule.mapping.id, e));
+            } else {
+                logger.add("INFO", format!("👀 Watching real-time [{}] at {:?}", rule.mapping.id, rule.mapping.source_dir));
+            }
         } else if rule.mapping.sync_mode == "interval" {
             logger.add("INFO", format!("⏰ Interval sync configured for [{}] (every {}s)", rule.mapping.id, rule.mapping.interval_seconds));
+        } else {
+            logger.add("INFO", format!("⏸️ Source folder missing/unmounted for [{}]. Watcher skipped.", rule.mapping.id));
         }
     }
 
@@ -171,12 +173,10 @@ let config = AppConfig::load_or_create("config.toml")?;
                                 continue;
                             };
 
-                            // Ignore events if folder is configured for interval sync mode
                             if rule.mapping.sync_mode == "interval" {
                                 continue;
                             }
 
-                            // 🎯 INCLUDE/EXCLUDE CHECK: Skip if path is disallowed by filters
                             if let Ok(rel_path) = path.strip_prefix(&rule.mapping.source_dir) {
                                 if !rule.is_allowed(rel_path) {
                                     continue;
@@ -229,68 +229,146 @@ async fn shutdown_signal() {
 async fn run_initial_crawl(
     rule: &CompiledFolderRule,
     job_tx: &mpsc::Sender<SyncJob>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut it = WalkDir::new(&rule.mapping.source_dir).into_iter();
+    logger: &LogStore,
+) {
+    let source = rule.mapping.source_dir.clone();
+    let dest = rule.mapping.destination_dir.clone();
+    let rule_id = rule.mapping.id.clone();
 
-    loop {
-        let entry = match it.next() {
-            Some(Ok(e)) => e,
-            Some(Err(_)) => continue,
-            None => break,
-        };
+    // 🛡️ NON-BLOCKING PATH & MOUNT CHECK
+    // Runs inside Tokio's blocking thread pool so network timeouts don't freeze the app
+    let (source_exists, dest_exists, is_mounted) = tokio::task::spawn_blocking(move || {
+        let s_exists = source.exists();
+        let d_exists = dest.exists();
 
-        let path = entry.path();
-        if let Ok(rel_path) = path.strip_prefix(&rule.mapping.source_dir) {
-            if rel_path.as_os_str().is_empty() {
-                continue;
+        let mut mounted = false;
+        if d_exists {
+            let mount_flag = dest.join(".mounted");
+            // Auto-create .mounted file if destination exists but flag is missing
+            if !mount_flag.exists() {
+                let _ = std::fs::File::create(&mount_flag);
             }
+            mounted = mount_flag.exists();
+        }
 
-            // Skip excluded directories entirely to avoid traversing unneeded trees
-            if rule.is_excluded(rel_path) && entry.file_type().is_dir() {
+        (s_exists, d_exists, mounted)
+    })
+    .await
+    .unwrap_or((false, false, false));
+
+    if !source_exists {
+        logger.add(
+            "INFO",
+            format!("⏸️ Source directory for [{}] missing or unmounted.", rule_id),
+        );
+        return;
+    }
+
+    if !dest_exists {
+        logger.add(
+            "ERROR",
+            format!("⚠️ Destination folder missing or timed out for [{}]: {:?}", rule_id, rule.mapping.destination_dir),
+        );
+        return;
+    }
+
+    if !is_mounted {
+        logger.add(
+            "INFO",
+            format!("⏸️ Drive unmounted (.mounted missing) for [{}]. Skipping crawl.", rule_id),
+        );
+        return;
+    }
+
+    let source_dir = rule.mapping.source_dir.clone();
+    let rule_clone = rule.clone();
+    let tx_clone = job_tx.clone();
+    let logger_clone = logger.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let mut it = WalkDir::new(&source_dir).into_iter();
+
+        loop {
+            let entry = match it.next() {
+                Some(Ok(e)) => e,
+                Some(Err(err)) => {
+                    logger_clone.add(
+                        "ERROR",
+                        format!("Skipped unreadable path in [{}]: {}", rule_id, err),
+                    );
+                    continue;
+                }
+                None => break,
+            };
+
+            let path = entry.path();
+
+            if entry.file_type().is_dir() && path.starts_with(&rule_clone.mapping.destination_dir) {
                 it.skip_current_dir();
                 continue;
             }
 
-            // 🎯 INCLUDE/EXCLUDE CHECK: Check both exclude and include rules
-            if path.is_file() && rule.is_allowed(rel_path) {
-                let _ = job_tx
-                    .send(SyncJob {
+            if let Ok(rel_path) = path.strip_prefix(&source_dir) {
+                if rel_path.as_os_str().is_empty() {
+                    continue;
+                }
+
+                if rule_clone.is_excluded(rel_path) && entry.file_type().is_dir() {
+                    it.skip_current_dir();
+                    continue;
+                }
+
+                if path.is_file() && rule_clone.is_allowed(rel_path) {
+                    let _ = tx_clone.blocking_send(SyncJob {
                         path: path.to_path_buf(),
-                        rule: rule.clone(),
-                    })
-                    .await;
+                        rule: rule_clone.clone(),
+                    });
+                }
             }
         }
-    }
-    Ok(())
+    })
+    .await
+    .ok();
 }
 
 async fn sync_single_file(
     path: &Path,
     rule: &CompiledFolderRule,
     db: &Arc<Mutex<Db>>,
+    logger: &LogStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 🛡️ INFINITE LOOP GUARD: Drop paths that point inside destination_dir
     if path.starts_with(&rule.mapping.destination_dir) {
         return Ok(());
     }
-
 
     let relative_path = match path.strip_prefix(&rule.mapping.source_dir) {
         Ok(rel) => rel,
         Err(_) => return Ok(()),
     };
 
-    // 🎯 INCLUDE/EXCLUDE CHECK: Skip if file does not pass rules
     if !rule.is_allowed(relative_path) {
         return Ok(());
     }
 
-    // 🛡️ UNMOUNT / DISCONNECT GUARD
-    if !rule.mapping.destination_dir.exists()
-        || !rule.mapping.destination_dir.join(".mounted").exists()
-    {
-        // Destination is disconnected or unmounted; skip quietly without crashing
+    let dest = rule.mapping.destination_dir.clone();
+    let rule_id = rule.mapping.id.clone();
+
+    let (dest_exists, is_mounted) = tokio::task::spawn_blocking(move || {
+        let d_exists = dest.exists();
+        let mounted = d_exists && dest.join(".mounted").exists();
+        (d_exists, mounted)
+    })
+    .await?;
+
+    if !dest_exists {
+        logger.add(
+            "ERROR",
+            format!("⚠️ Destination path unavailable or timed out for [{}]", rule_id),
+        );
+        return Ok(());
+    }
+
+    if !is_mounted {
         return Ok(());
     }
 

@@ -95,12 +95,13 @@ impl AppConfig {
         }
     }
 
-    /// Compile string glob patterns into optimized GlobSets
- pub fn compile_rules(&self, logger: &LogStore) -> Vec<CompiledFolderRule> {
+
+/// Fast rule compilation without blocking network filesystem calls
+    pub fn compile_rules(&self, logger: &LogStore) -> Vec<CompiledFolderRule> {
         let mut rules = Vec::new();
 
         for folder in &self.folders {
-            // 🛡️ RECURSIVE LOOP GUARD: Log warning to Web UI and skip dangerous mappings
+            // 🛡️ RECURSIVE LOOP GUARD (Pure Path String Checks - No filesystem I/O)
             if let Err(err_msg) = validate_path_boundaries(&folder.source_dir, &folder.destination_dir) {
                 eprintln!("⚠️ [CONFIG WARNING] Folder '{}' skipped: {}", folder.id, err_msg);
                 logger.add("ERROR", format!("Skipped folder ['{}']: {}", folder.id, err_msg));
@@ -149,9 +150,6 @@ impl AppConfig {
         rules
     }
 
-
-
-
     fn clean_and_expand_paths(&mut self) {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".to_string());
         for folder in &mut self.folders {
@@ -162,33 +160,12 @@ impl AppConfig {
     }
 
     fn validate_paths(&self) -> Result<(), io::Error> {
-        for folder in &self.folders {
-            if !folder.source_dir.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Source directory for [{}] does not exist: {:?}", folder.id, folder.source_dir),
-                ));
-            }
-
-            // Check if destination exists
-            if folder.destination_dir.exists() {
-                // 📌 Auto-create .mounted file if destination directory is accessible
-                let mount_flag = folder.destination_dir.join(".mounted");
-                if !mount_flag.exists() {
-                    let _ = fs::File::create(&mount_flag);
-                }
-            } else {
-                println!(
-                    "⚠️ Destination directory for [{}] is currently unavailable or unmounted: {:?}",
-                    folder.id, folder.destination_dir
-                );
-            }
-        }
+        // Zero blocking calls on app load
         Ok(())
     }
 }
-
-
+    
+   
 
 
 
@@ -206,21 +183,17 @@ fn clean_path(path: &Path, home: &str) -> PathBuf {
 }
 
 impl CompiledFolderRule {
-    /// Helper to maintain backward compatibility with old `is_excluded` call sites
     pub fn is_excluded<P: AsRef<Path>>(&self, relative_path: P) -> bool {
         self.exclude_glob_set.is_match(relative_path.as_ref())
     }
 
-    /// Evaluates both exclude rules and include whitelists
     pub fn is_allowed<P: AsRef<Path>>(&self, relative_path: P) -> bool {
         let path = relative_path.as_ref();
 
-        // 1. If exclude rule matches, reject
         if self.exclude_glob_set.is_match(path) {
             return false;
         }
 
-        // 2. If include set exists, reject files that do NOT match the whitelist
         if let Some(ref include_set) = self.include_glob_set {
             return include_set.is_match(path);
         }
@@ -230,31 +203,31 @@ impl CompiledFolderRule {
 }
 
 
-/// Helper function to check overlapping or nested paths
-fn validate_path_boundaries(source: &Path, destination: &Path) -> Result<(), String> {
-    let source_canon = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
-    let dest_canon = destination.canonicalize().unwrap_or_else(|_| destination.to_path_buf());
 
-    if source_canon == dest_canon {
+/// Non-blocking path comparison using normalized PathBufs instead of system canonicalize
+fn validate_path_boundaries(source: &Path, destination: &Path) -> Result<(), String> {
+    if source == destination {
         return Err(format!(
             "Source and Destination cannot be identical! ({:?})",
-            source_canon
+            source
         ));
     }
 
-    if dest_canon.starts_with(&source_canon) {
+    if destination.starts_with(source) {
         return Err(format!(
             "Destination ({:?}) is inside Source ({:?}). Loop prevented!",
-            dest_canon, source_canon
+            destination, source
         ));
     }
 
-    if source_canon.starts_with(&dest_canon) {
+    if source.starts_with(destination) {
         return Err(format!(
             "Source ({:?}) is inside Destination ({:?}). Loop prevented!",
-            source_canon, dest_canon
+            source, destination
         ));
     }
 
     Ok(())
 }
+
+
