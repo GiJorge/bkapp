@@ -1,6 +1,7 @@
 db_path = "backup_index.db"
 debounce_seconds = 2
 max_concurrent_copies = 4
+timezone = "Africa/Addis_Ababa"
 
 [[folders]]
 id = "memos"
